@@ -14,6 +14,7 @@
 #include "draw_line.h"
 #include "text.h"
 #include "scene.h"
+#include "ui.h"
 
 #include <stdio.h>   /* snprintf for HUD */
 
@@ -278,9 +279,9 @@ int main(int argc, char **argv) {
 
     /* Load default scene + bake lightmaps. */
     scene_load_default(&g_scene);
-    const vec3_t light_pos       = { 3.0f, 8.0f, 4.0f };
-    const f32    light_intensity = 35.0f;
-    const f32    ambient_level   = 0.12f;
+    vec3_t light_pos              = { 3.0f, 8.0f, 4.0f };
+    f32    light_intensity        = 35.0f;
+    f32    ambient_level          = 0.12f;
     const u64 t_bake_start = SDL_GetPerformanceCounter();
     scene_bake_lightmaps(&g_scene, light_pos, light_intensity, ambient_level);
     const f32 bake_ms = (f32)(SDL_GetPerformanceCounter() - t_bake_start) /
@@ -329,8 +330,16 @@ int main(int argc, char **argv) {
     int last_mouse_x = 0, last_mouse_y = 0;
     int mouse_press_x = 0, mouse_press_y = 0;
     int mouse_left_dragged = 0;
+    int prev_mouse_left_down = 0;          /* edge detection */
 
     int selected_face = -1;
+
+    /* UI panel rect (right side). Mouse inside this region routes a UI. */
+    const int PANEL_X = WIDTH - 280;
+    const int PANEL_Y = 80;
+    const int PANEL_W = 270;
+    const int PANEL_H = 200;
+    ui_ctx_t ui = {0};
 
     u32 frames      = 0;
     u32 last_fps_ms = SDL_GetTicks();
@@ -426,6 +435,12 @@ int main(int argc, char **argv) {
                 const int dy = ev.motion.y - last_mouse_y;
                 last_mouse_x = ev.motion.x;
                 last_mouse_y = ev.motion.y;
+                /* Si el mouse está sobre el panel UI, no mover cámara. */
+                const bool in_ui = (ev.motion.x >= PANEL_X &&
+                                     ev.motion.x <  PANEL_X + PANEL_W &&
+                                     ev.motion.y >= PANEL_Y &&
+                                     ev.motion.y <  PANEL_Y + PANEL_H);
+                if (in_ui) continue;
                 if (mouse_left_down) {
                     const int total_dx = ev.motion.x - mouse_press_x;
                     const int total_dy = ev.motion.y - mouse_press_y;
@@ -526,6 +541,37 @@ int main(int argc, char **argv) {
             hud_frame_count = 0;
             last_hud_ts = hud_now;
         }
+
+        /* ─── UI panel ─── */
+        const bool curr_mouse_down = mouse_left_down != 0;
+        const bool ui_mouse_pressed = curr_mouse_down && !prev_mouse_left_down;
+        prev_mouse_left_down = curr_mouse_down;
+
+        ui_begin(&ui, &fb, last_mouse_x, last_mouse_y,
+                  curr_mouse_down, ui_mouse_pressed);
+        ui_panel(&ui, PANEL_X, PANEL_Y, PANEL_W, PANEL_H, "LIGHT");
+        ui_label(&ui, PANEL_X + 8, PANEL_Y + 30, "INTENSITY", 0xFFFFFFFFu);
+        f32 prev_intensity = light_intensity;
+        if (ui_slider_f(&ui, PANEL_X + 8, PANEL_Y + 46, PANEL_W - 16, 16,
+                        &light_intensity, 0.0f, 100.0f)) { (void)0; }
+        ui_label(&ui, PANEL_X + 8, PANEL_Y + 72, "AMBIENT", 0xFFFFFFFFu);
+        f32 prev_ambient = ambient_level;
+        if (ui_slider_f(&ui, PANEL_X + 8, PANEL_Y + 88, PANEL_W - 16, 16,
+                        &ambient_level, 0.0f, 0.5f)) { (void)0; }
+        ui_label(&ui, PANEL_X + 8, PANEL_Y + 114, "LIGHT HEIGHT", 0xFFFFFFFFu);
+        f32 prev_lh = light_pos.y;
+        if (ui_slider_f(&ui, PANEL_X + 8, PANEL_Y + 130, PANEL_W - 16, 16,
+                        &light_pos.y, 1.0f, 20.0f)) { (void)0; }
+
+        /* Re-bake si algún slider cambió (debounced — solo cuando mouse soltado
+         * para evitar bake en cada movimiento). */
+        const bool changed_now = (light_intensity != prev_intensity) ||
+                                  (ambient_level != prev_ambient) ||
+                                  (light_pos.y   != prev_lh);
+        if (changed_now) {
+            scene_bake_lightmaps(&g_scene, light_pos, light_intensity, ambient_level);
+        }
+        ui_end(&ui);
 
         /* Selection outline overlay (single-threaded, post workers). Dibuja
          * los 4 edges del quad seleccionado como wireframe naranja. */
