@@ -1,0 +1,11 @@
+*.o
+*.a
+*.d
+sw_renderer/sw_renderer
+raytracer/raytracer
+*.ppm
+!raytracer/earth.ppm
+core
+core.*
+.vscode/
+.claude/
