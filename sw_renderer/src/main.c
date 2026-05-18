@@ -11,6 +11,7 @@
 #include "span_buffer.h"
 #include "rast_scan.h"
 #include "lightmap.h"
+#include "draw_line.h"
 
 #include <SDL2/SDL.h>
 #include <pthread.h>
@@ -74,6 +75,55 @@ static const bsp_face_t SCENE_FACES[N_FACES] = {
     { .verts = { {-0.5f, 0, -3}, {-0.5f, 0, -2}, {-0.5f, 4, -2}, {-0.5f, 4, -3} },
       .uvs   = { {-3, 0}, {-2, 0}, {-2, 4}, {-3, 4} }, .tex = tex_brick },
 };
+
+/* Ray-vs-quad intersection. Devuelve t del hit en (0, ∞), o -1 si miss. */
+static f32 face_intersect(const bsp_face_t *face, vec3_t orig, vec3_t dir) {
+    const vec3_t e1 = v3_sub(face->verts[1], face->verts[0]);
+    const vec3_t e2 = v3_sub(face->verts[3], face->verts[0]);
+    const vec3_t n  = v3_cross(e1, e2);
+    const f32    denom = v3_dot(n, dir);
+    if (fabsf(denom) < 1e-8f) return -1.0f;
+    const f32 D = v3_dot(n, face->verts[0]);
+    const f32 t = (D - v3_dot(n, orig)) / denom;
+    if (t < 0.001f) return -1.0f;
+    const vec3_t P     = v3_add(orig, v3_scale(dir, t));
+    const vec3_t local = v3_sub(P, face->verts[0]);
+    const f32 a = v3_dot(local, e1) / v3_dot(e1, e1);
+    const f32 b = v3_dot(local, e2) / v3_dot(e2, e2);
+    if (a < 0.0f || a > 1.0f || b < 0.0f || b > 1.0f) return -1.0f;
+    return t;
+}
+
+/* Picking: convierte (screen_x, screen_y) a un rayo y testea contra cada
+ * face. Devuelve idx de la más cercana, o -1 si no hay hit. */
+static int pick_face(int sx, int sy,
+                     vec3_t eye, vec3_t target, vec3_t world_up,
+                     f32 vfov_rad, f32 aspect) {
+    const f32 ndc_x = 2.0f * (f32)sx / (f32)WIDTH  - 1.0f;
+    const f32 ndc_y = 1.0f - 2.0f * (f32)sy / (f32)HEIGHT;
+    const f32 t_y   = tanf(vfov_rad * 0.5f);
+    const f32 t_x   = t_y * aspect;
+
+    const vec3_t fwd   = v3_normalize(v3_sub(target, eye));
+    const vec3_t right = v3_normalize(v3_cross(fwd, world_up));
+    const vec3_t up    = v3_normalize(v3_cross(right, fwd));
+
+    const vec3_t ray_dir = v3_add(v3_add(
+        v3_scale(right, ndc_x * t_x),
+        v3_scale(up,    ndc_y * t_y)),
+        fwd);
+
+    int best = -1;
+    f32 best_t = INFINITY;
+    for (int i = 0; i < N_FACES; ++i) {
+        const f32 t = face_intersect(&SCENE_FACES[i], eye, ray_dir);
+        if (t > 0.0f && t < best_t) {
+            best_t = t;
+            best = i;
+        }
+    }
+    return best;
+}
 
 static vec3_t face_center(const bsp_face_t *f) {
     return (vec3_t){
@@ -280,67 +330,130 @@ int main(int argc, char **argv) {
     LOG_INFO("M10 — pool con %d threads (cada stripe ~%d scanlines)",
              pool.n, HEIGHT / pool.n);
 
-    const mat4_t proj = mat4_perspective(deg2rad(75.0f),
+    const mat4_t proj = mat4_perspective(deg2rad(60.0f),
                                           (f32)WIDTH / (f32)HEIGHT, 0.05f, 100.0f);
 
-    vec3_t cam_pos = { 0.0f, 2.0f, 0.0f };
-    f32    yaw = 0.0f, pitch = 0.0f;
-    const f32 move_speed = 4.0f, look_speed = 1.8f;
+    /*
+     * Cámara orbital tipo editor:
+     *   - eye = target + radius·(sin(yaw)cos(pitch), sin(pitch), cos(yaw)cos(pitch))
+     *   - left-drag  = orbit (rotate yaw/pitch)
+     *   - right-drag = pan (translate target in cam plane)
+     *   - wheel      = zoom (change radius)
+     *   - F          = reset to default
+     */
+    vec3_t cam_target = { 0.0f, 2.0f, -2.5f };  /* pillar center */
+    f32    cam_yaw    = 0.0f;
+    f32    cam_pitch  = 0.2f;                    /* slight tilt down */
+    f32    cam_radius = 6.5f;
+    const f32 ORBIT_SPEED = 0.008f;
+    const f32 PAN_SPEED   = 0.012f;
+    const f32 ZOOM_FACTOR = 1.12f;
 
-    const u64 freq = SDL_GetPerformanceFrequency();
-    u64 t_last      = SDL_GetPerformanceCounter();
+    int mouse_left_down = 0;
+    int mouse_right_down = 0;
+    int last_mouse_x = 0, last_mouse_y = 0;
+    int mouse_press_x = 0, mouse_press_y = 0;
+    int mouse_left_dragged = 0;
+
+    int selected_face = -1;
+
     u32 frames      = 0;
     u32 last_fps_ms = SDL_GetTicks();
     u64 sum_drawn = 0, sum_skipped = 0;
 
-    LOG_INFO("WASD/flechas para moverse. ESC sale.");
+    LOG_INFO("Editor E1 — orbit camera.");
+    LOG_INFO("  left-drag = orbit, right-drag = pan, wheel = zoom, F = reset, ESC sale.");
 
     bool running = true;
     while (running) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) running = false;
-            else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) running = false;
+            else if (ev.type == SDL_KEYDOWN) {
+                if (ev.key.keysym.sym == SDLK_ESCAPE) running = false;
+                else if (ev.key.keysym.sym == SDLK_f) {
+                    /* Reset cámara a default. */
+                    cam_target = (vec3_t){ 0.0f, 2.0f, -2.5f };
+                    cam_yaw    = 0.0f;
+                    cam_pitch  = 0.2f;
+                    cam_radius = 6.5f;
+                }
+            }
+            else if (ev.type == SDL_MOUSEBUTTONDOWN) {
+                if (ev.button.button == SDL_BUTTON_LEFT) {
+                    mouse_left_down    = 1;
+                    mouse_left_dragged = 0;
+                    mouse_press_x      = ev.button.x;
+                    mouse_press_y      = ev.button.y;
+                }
+                if (ev.button.button == SDL_BUTTON_RIGHT) mouse_right_down = 1;
+                last_mouse_x = ev.button.x;
+                last_mouse_y = ev.button.y;
+            }
+            else if (ev.type == SDL_MOUSEBUTTONUP) {
+                if (ev.button.button == SDL_BUTTON_LEFT) {
+                    mouse_left_down = 0;
+                    /* Click sin drag = pick. */
+                    if (!mouse_left_dragged) {
+                        const vec3_t eye_pick = {
+                            cam_target.x + cam_radius * sinf(cam_yaw) * cosf(cam_pitch),
+                            cam_target.y + cam_radius * sinf(cam_pitch),
+                            cam_target.z + cam_radius * cosf(cam_yaw) * cosf(cam_pitch),
+                        };
+                        selected_face = pick_face(ev.button.x, ev.button.y,
+                                                   eye_pick, cam_target,
+                                                   (vec3_t){0.0f, 1.0f, 0.0f},
+                                                   deg2rad(60.0f),
+                                                   (f32)WIDTH / (f32)HEIGHT);
+                        LOG_INFO("picked face: %d", selected_face);
+                    }
+                }
+                if (ev.button.button == SDL_BUTTON_RIGHT) mouse_right_down = 0;
+            }
+            else if (ev.type == SDL_MOUSEMOTION) {
+                const int dx = ev.motion.x - last_mouse_x;
+                const int dy = ev.motion.y - last_mouse_y;
+                last_mouse_x = ev.motion.x;
+                last_mouse_y = ev.motion.y;
+                if (mouse_left_down) {
+                    const int total_dx = ev.motion.x - mouse_press_x;
+                    const int total_dy = ev.motion.y - mouse_press_y;
+                    if (abs(total_dx) + abs(total_dy) > 4) mouse_left_dragged = 1;
+                    /* Orbit: drag horizontal = yaw, vertical = pitch. */
+                    cam_yaw   -= (f32)dx * ORBIT_SPEED;
+                    cam_pitch -= (f32)dy * ORBIT_SPEED;
+                    if (cam_pitch >  1.5f) cam_pitch =  1.5f;
+                    if (cam_pitch < -1.5f) cam_pitch = -1.5f;
+                } else if (mouse_right_down) {
+                    /* Pan: mover target a lo largo de los ejes right/up de la cámara. */
+                    const vec3_t fwd = {
+                        sinf(cam_yaw) * cosf(cam_pitch),
+                        sinf(cam_pitch),
+                        cosf(cam_yaw) * cosf(cam_pitch),
+                    };
+                    const vec3_t world_up = { 0.0f, 1.0f, 0.0f };
+                    const vec3_t right = v3_normalize(v3_cross(fwd, world_up));
+                    const vec3_t up    = v3_normalize(v3_cross(right, fwd));
+                    const f32 scale = cam_radius * PAN_SPEED;
+                    cam_target = v3_add(cam_target, v3_scale(right,  -(f32)dx * scale));
+                    cam_target = v3_add(cam_target, v3_scale(up,      (f32)dy * scale));
+                }
+            }
+            else if (ev.type == SDL_MOUSEWHEEL) {
+                if (ev.wheel.y > 0)      cam_radius /= ZOOM_FACTOR;
+                else if (ev.wheel.y < 0) cam_radius *= ZOOM_FACTOR;
+                if (cam_radius <  0.5f)  cam_radius =  0.5f;
+                if (cam_radius > 40.0f)  cam_radius = 40.0f;
+            }
         }
 
-        const u64 t_now = SDL_GetPerformanceCounter();
-        const f32 dt    = (f32)(t_now - t_last) / (f32)freq;
-        t_last = t_now;
-
-        const Uint8 *keys = SDL_GetKeyboardState(NULL);
-        f32 dz = 0, dx = 0, dyaw = 0, dpitch = 0;
-        /* W = forward (cam_pos += fwd_xz). fwd_xz = (-sin(yaw), 0, -cos(yaw)),
-         * que en yaw=0 es (0,0,-1) → moviendo cam_pos en esa dir baja z, que
-         * es "adelante" porque el view matrix mira -z. */
-        if (keys[SDL_SCANCODE_W]) dz += 1.0f;
-        if (keys[SDL_SCANCODE_S]) dz -= 1.0f;
-        if (keys[SDL_SCANCODE_A]) dx -= 1.0f;
-        if (keys[SDL_SCANCODE_D]) dx += 1.0f;
-        /* Para "look right" necesitamos yaw negativo (forward rota hacia +x).
-         * Para "look up" necesitamos pitch positivo (forward.y > 0). */
-        if (keys[SDL_SCANCODE_LEFT])  dyaw   += 1.0f;
-        if (keys[SDL_SCANCODE_RIGHT]) dyaw   -= 1.0f;
-        if (keys[SDL_SCANCODE_UP])    dpitch += 1.0f;
-        if (keys[SDL_SCANCODE_DOWN])  dpitch -= 1.0f;
-
-        yaw   += dyaw   * look_speed * dt;
-        pitch += dpitch * look_speed * dt;
-        if (pitch >  1.4f) pitch =  1.4f;
-        if (pitch < -1.4f) pitch = -1.4f;
-
-        const vec3_t fwd_xz   = { -sinf(yaw), 0.0f, -cosf(yaw) };
-        const vec3_t right_xz = {  cosf(yaw), 0.0f, -sinf(yaw) };
-        cam_pos = v3_add(cam_pos, v3_scale(fwd_xz,   dz * move_speed * dt));
-        cam_pos = v3_add(cam_pos, v3_scale(right_xz, dx * move_speed * dt));
-        if (cam_pos.x >  5.7f) cam_pos.x =  5.7f;
-        if (cam_pos.x < -5.7f) cam_pos.x = -5.7f;
-        if (cam_pos.z >  5.7f) cam_pos.z =  5.7f;
-        if (cam_pos.z < -5.7f) cam_pos.z = -5.7f;
-
-        const mat4_t view = mat4_mul(
-            mat4_rotate_x(-pitch),
-            mat4_mul(mat4_rotate_y(-yaw),
-                      mat4_translate(v3_neg(cam_pos))));
+        /* Computar eye desde orbit params. */
+        const vec3_t cam_eye = {
+            cam_target.x + cam_radius * sinf(cam_yaw) * cosf(cam_pitch),
+            cam_target.y + cam_radius * sinf(cam_pitch),
+            cam_target.z + cam_radius * cosf(cam_yaw) * cosf(cam_pitch),
+        };
+        const mat4_t view = mat4_look_at(cam_eye, cam_target, (vec3_t){0.0f, 1.0f, 0.0f});
         const mat4_t mvp  = mat4_mul(proj, view);
 
         framebuf_clear_color(&fb, argb8888(0, 0, 0));
@@ -349,7 +462,7 @@ int main(int argc, char **argv) {
         f32 dist_sq[N_FACES];
         for (int i = 0; i < N_FACES; ++i) {
             order[i] = i;
-            dist_sq[i] = v3_length_sq(v3_sub(face_center(&SCENE_FACES[i]), cam_pos));
+            dist_sq[i] = v3_length_sq(v3_sub(face_center(&SCENE_FACES[i]), cam_eye));
         }
         for (int i = 1; i < N_FACES; ++i) {
             const int key = order[i];
@@ -378,6 +491,31 @@ int main(int argc, char **argv) {
         /* Dispatch a workers + wait. */
         pool_render_frame(&pool);
 
+        /* Selection outline overlay (single-threaded, post workers). Dibuja
+         * los 4 edges del quad seleccionado como wireframe naranja. */
+        if (selected_face >= 0) {
+            const bsp_face_t *sf = &SCENE_FACES[selected_face];
+            int sx[4], sy[4];
+            bool all_in_front = true;
+            for (int i = 0; i < 4; ++i) {
+                const vec4_t v4 = { sf->verts[i].x, sf->verts[i].y, sf->verts[i].z, 1.0f };
+                const vec4_t clip = mat4_mul_vec4(mvp, v4);
+                if (clip.w <= 0.1f) { all_in_front = false; break; }
+                const f32 invw = 1.0f / clip.w;
+                sx[i] = (int)((clip.x * invw * 0.5f + 0.5f) * (f32)WIDTH);
+                sy[i] = (int)((1.0f - (clip.y * invw * 0.5f + 0.5f)) * (f32)HEIGHT);
+            }
+            if (all_in_front) {
+                const u32 outline = argb8888(255, 180, 0);
+                for (int i = 0; i < 4; ++i) {
+                    const int j = (i + 1) % 4;
+                    draw_line(&fb, sx[i], sy[i], sx[j], sy[j], outline);
+                    /* Doble pixel para más visibilidad */
+                    draw_line(&fb, sx[i] + 1, sy[i], sx[j] + 1, sy[j], outline);
+                }
+            }
+        }
+
         SDL_Surface *win_surface = SDL_GetWindowSurface(win);
         if (win_surface) {
             SDL_BlitSurface(back, NULL, win_surface, NULL);
@@ -395,9 +533,9 @@ int main(int argc, char **argv) {
             const u64 total = sum_drawn + sum_skipped;
             const f32 fill  = (f32)sum_drawn / (f32)(WIDTH * HEIGHT * frames);
             const f32 effic = total ? (f32)sum_drawn / (f32)total : 0.0f;
-            LOG_INFO("[%d threads] fps=%u  fill=%.3f×  effic=%.0f%%  pos=(%.1f, %.1f, %.1f)",
+            LOG_INFO("[%d threads] fps=%u  fill=%.3f×  effic=%.0f%%  target=(%.1f, %.1f, %.1f) r=%.1f",
                      pool.n, frames, fill, effic * 100.0f,
-                     cam_pos.x, cam_pos.y, cam_pos.z);
+                     cam_target.x, cam_target.y, cam_target.z, cam_radius);
             frames = 0; sum_drawn = sum_skipped = 0;
             last_fps_ms = now_ms;
         }
