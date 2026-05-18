@@ -13,6 +13,7 @@
 #include "lightmap.h"
 #include "draw_line.h"
 #include "text.h"
+#include "scene.h"
 
 #include <stdio.h>   /* snprintf for HUD */
 
@@ -46,38 +47,15 @@
 
 #define WIDTH    800
 #define HEIGHT   600
-#define N_FACES  10
-#define LM_DIM   32
 #define MAX_THREADS 16
 
 static u32 argb8888(u8 r, u8 g, u8 b) {
     return (0xFFu << 24) | ((u32)r << 16) | ((u32)g << 8) | (u32)b;
 }
 
-/* ─── Escena (misma de M7-M9) ───────────────────────────────────────── */
-
-static const bsp_face_t SCENE_FACES[N_FACES] = {
-    { .verts = { {-6, 0,  6}, { 6, 0,  6}, { 6, 0, -6}, {-6, 0, -6} },
-      .uvs   = { {-6,  6}, { 6,  6}, { 6, -6}, {-6, -6} }, .tex = tex_floor },
-    { .verts = { {-6, 4, -6}, { 6, 4, -6}, { 6, 4,  6}, {-6, 4,  6} },
-      .uvs   = { {-6, -6}, { 6, -6}, { 6,  6}, {-6,  6} }, .tex = tex_ceiling },
-    { .verts = { {-6, 0, 6}, {-6, 4, 6}, { 6, 4, 6}, { 6, 0, 6} },
-      .uvs   = { {-6, 0}, {-6, 4}, { 6, 4}, { 6, 0} }, .tex = tex_brick },
-    { .verts = { { 6, 0, -6}, { 6, 4, -6}, {-6, 4, -6}, {-6, 0, -6} },
-      .uvs   = { {-6, 0}, {-6, 4}, { 6, 4}, { 6, 0} }, .tex = tex_brick },
-    { .verts = { { 6, 0,  6}, { 6, 4,  6}, { 6, 4, -6}, { 6, 0, -6} },
-      .uvs   = { {-6, 0}, {-6, 4}, { 6, 4}, { 6, 0} }, .tex = tex_brick },
-    { .verts = { {-6, 0, -6}, {-6, 4, -6}, {-6, 4,  6}, {-6, 0,  6} },
-      .uvs   = { {-6, 0}, {-6, 4}, { 6, 4}, { 6, 0} }, .tex = tex_brick },
-    { .verts = { {-0.5f, 0, -2}, { 0.5f, 0, -2}, { 0.5f, 4, -2}, {-0.5f, 4, -2} },
-      .uvs   = { {-0.5f, 0}, { 0.5f, 0}, { 0.5f, 4}, {-0.5f, 4} }, .tex = tex_brick },
-    { .verts = { { 0.5f, 0, -3}, {-0.5f, 0, -3}, {-0.5f, 4, -3}, { 0.5f, 4, -3} },
-      .uvs   = { { 0.5f, 0}, {-0.5f, 0}, {-0.5f, 4}, { 0.5f, 4} }, .tex = tex_brick },
-    { .verts = { { 0.5f, 0, -2}, { 0.5f, 0, -3}, { 0.5f, 4, -3}, { 0.5f, 4, -2} },
-      .uvs   = { {-2, 0}, {-3, 0}, {-3, 4}, {-2, 4} }, .tex = tex_brick },
-    { .verts = { {-0.5f, 0, -3}, {-0.5f, 0, -2}, {-0.5f, 4, -2}, {-0.5f, 4, -3} },
-      .uvs   = { {-3, 0}, {-2, 0}, {-2, 4}, {-3, 4} }, .tex = tex_brick },
-};
+/* Scene runtime (heap-allocated, mutable). Initialized via
+ * scene_load_default in main. Hotkeys allow add/remove primitives. */
+static scene_t g_scene;
 
 /* Ray-vs-quad intersection. Devuelve t del hit en (0, ∞), o -1 si miss. */
 static f32 face_intersect(const bsp_face_t *face, vec3_t orig, vec3_t dir) {
@@ -118,8 +96,8 @@ static int pick_face(int sx, int sy,
 
     int best = -1;
     f32 best_t = INFINITY;
-    for (int i = 0; i < N_FACES; ++i) {
-        const f32 t = face_intersect(&SCENE_FACES[i], eye, ray_dir);
+    for (int i = 0; i < g_scene.n_faces; ++i) {
+        const f32 t = face_intersect(&g_scene.faces[i], eye, ray_dir);
         if (t > 0.0f && t < best_t) {
             best_t = t;
             best = i;
@@ -158,6 +136,7 @@ typedef struct {
     const int            *order;                  /* sorted indices */
     const lightmap_t     *lightmaps;
     const bsp_face_t     *faces;
+    int                   n_faces;                /* set per-frame from scene */
     f32                   near_w;                 /* clip plane threshold */
 } pool_t;
 
@@ -178,7 +157,7 @@ static void render_stripe(worker_t *w, pool_t *pool) {
     span_buffer_clear(&w->sb);
     static const u8 quad_tris[2][3] = { {0, 1, 2}, {0, 2, 3} };
 
-    for (int oi = 0; oi < N_FACES; ++oi) {
+    for (int oi = 0; oi < pool->n_faces; ++oi) {
         const int idx = pool->order[oi];
         const bsp_face_t   *face = &pool->faces[idx];
         const clip_vert_t  *cv   = pool->clip_verts[idx];
@@ -297,34 +276,27 @@ int main(int argc, char **argv) {
         .w = WIDTH, .h = HEIGHT, .pitch_pixels = pitch_pixels,
     };
 
-    /* Bake lightmaps (M8). */
-    static u32 lm_storage[N_FACES][LM_DIM * LM_DIM];
-    static lightmap_t lightmaps[N_FACES];
-    for (int i = 0; i < N_FACES; ++i) {
-        lightmaps[i] = (lightmap_t){ .texels = lm_storage[i], .w = LM_DIM, .h = LM_DIM };
-    }
-    const vec3_t light_pos       = { 0.0f, 3.8f, 4.0f };
-    const f32    light_intensity = 8.0f;
-    const f32    ambient_level   = 0.08f;
+    /* Load default scene + bake lightmaps. */
+    scene_load_default(&g_scene);
+    const vec3_t light_pos       = { 3.0f, 8.0f, 4.0f };
+    const f32    light_intensity = 35.0f;
+    const f32    ambient_level   = 0.12f;
     const u64 t_bake_start = SDL_GetPerformanceCounter();
-    for (int i = 0; i < N_FACES; ++i) {
-        lightmap_bake(&lightmaps[i], &SCENE_FACES[i],
-                      SCENE_FACES, N_FACES, i,
-                      light_pos, light_intensity, ambient_level);
-    }
+    scene_bake_lightmaps(&g_scene, light_pos, light_intensity, ambient_level);
     const f32 bake_ms = (f32)(SDL_GetPerformanceCounter() - t_bake_start) /
                         (f32)SDL_GetPerformanceFrequency() * 1000.0f;
-    LOG_INFO("lightmaps baked in %.1f ms", bake_ms);
+    LOG_INFO("lightmaps baked (%d faces) in %.1f ms", g_scene.n_faces, bake_ms);
 
     /* Init thread pool. */
     static pool_t pool;
-    static clip_vert_t clip_verts[N_FACES][4];
-    static int         order[N_FACES];
+    static clip_vert_t clip_verts[SCENE_MAX_FACES][4];
+    static int         order[SCENE_MAX_FACES];
     pool.fb         = &fb;
     pool.clip_verts = (const clip_vert_t (*)[4])clip_verts;
     pool.order      = order;
-    pool.lightmaps  = lightmaps;
-    pool.faces      = SCENE_FACES;
+    pool.lightmaps  = g_scene.lightmaps;
+    pool.faces      = g_scene.faces;
+    pool.n_faces    = g_scene.n_faces;
     pool.near_w     = 0.1f;   /* match perspective near; clip.w >= this required */
     if (!pool_init(&pool, n_threads)) {
         LOG_ERROR("pool init failed");
@@ -344,10 +316,10 @@ int main(int argc, char **argv) {
      *   - wheel      = zoom (change radius)
      *   - F          = reset to default
      */
-    vec3_t cam_target = { 0.0f, 2.0f, -2.5f };  /* pillar center */
-    f32    cam_yaw    = 0.0f;
-    f32    cam_pitch  = 0.2f;                    /* slight tilt down */
-    f32    cam_radius = 6.5f;
+    vec3_t cam_target = { 0.0f, 1.0f, 0.0f };    /* scene center */
+    f32    cam_yaw    = 0.3f;
+    f32    cam_pitch  = 0.25f;                    /* slight tilt down */
+    f32    cam_radius = 8.0f;
     const f32 ORBIT_SPEED = 0.008f;
     const f32 PAN_SPEED   = 0.012f;
     const f32 ZOOM_FACTOR = 1.12f;
@@ -377,18 +349,45 @@ int main(int argc, char **argv) {
                 else if (ev.key.keysym.sym == SDLK_f) {
                     /* F: focus selected (frame view on selection), o reset si nada. */
                     if (selected_face >= 0) {
-                        cam_target = face_center(&SCENE_FACES[selected_face]);
+                        cam_target = face_center(&g_scene.faces[selected_face]);
                         cam_radius = 4.5f;
                     } else {
-                        cam_target = (vec3_t){ 0.0f, 2.0f, -2.5f };
-                        cam_yaw    = 0.0f;
-                        cam_pitch  = 0.2f;
-                        cam_radius = 6.5f;
+                        cam_target = (vec3_t){ 0.0f, 1.0f, 0.0f };
+                        cam_yaw    = 0.3f;
+                        cam_pitch  = 0.25f;
+                        cam_radius = 8.0f;
                     }
                 }
                 else if (ev.key.keysym.sym == SDLK_ESCAPE && selected_face >= 0) {
                     /* ESC también deselecciona. Se sigue saliendo si no hay selección. */
                     selected_face = -1;
+                }
+                /* ─── E7: primitive add/remove hotkeys ─── */
+                else if (ev.key.keysym.sym == SDLK_1) {
+                    /* Cubo en la posición del cursor 3D (cam_target). */
+                    scene_add_cube(&g_scene, cam_target, 1.0f, tex_brick);
+                    scene_bake_lightmaps(&g_scene, light_pos,
+                                          light_intensity, ambient_level);
+                    LOG_INFO("added cube (now %d faces)", g_scene.n_faces);
+                }
+                else if (ev.key.keysym.sym == SDLK_2) {
+                    /* Pilar (4 sides + top, sin bottom — asume sobre piso). */
+                    scene_add_pillar(&g_scene, (vec3_t){cam_target.x, 0.0f, cam_target.z},
+                                       0.6f, 2.0f, tex_brick);
+                    scene_bake_lightmaps(&g_scene, light_pos,
+                                          light_intensity, ambient_level);
+                    LOG_INFO("added pillar (now %d faces)", g_scene.n_faces);
+                }
+                else if (ev.key.keysym.sym == SDLK_DELETE ||
+                          ev.key.keysym.sym == SDLK_BACKSPACE) {
+                    /* Borra la face seleccionada. */
+                    if (selected_face >= 0) {
+                        scene_remove_face(&g_scene, selected_face);
+                        scene_bake_lightmaps(&g_scene, light_pos,
+                                              light_intensity, ambient_level);
+                        LOG_INFO("removed face (now %d faces)", g_scene.n_faces);
+                        selected_face = -1;
+                    }
                 }
             }
             else if (ev.type == SDL_MOUSEBUTTONDOWN) {
@@ -468,15 +467,25 @@ int main(int argc, char **argv) {
         const mat4_t view = mat4_look_at(cam_eye, cam_target, (vec3_t){0.0f, 1.0f, 0.0f});
         const mat4_t mvp  = mat4_mul(proj, view);
 
-        framebuf_clear_color(&fb, argb8888(0, 0, 0));
+        /* Sky color: gradient simple per-row (linear lerp horizon → zenith). */
+        for (int yy = 0; yy < HEIGHT; ++yy) {
+            const f32 t = (f32)yy / (f32)(HEIGHT - 1);
+            const u8 r = (u8)(50  * t + 110 * (1.0f - t));
+            const u8 g = (u8)(80  * t + 140 * (1.0f - t));
+            const u8 b = (u8)(140 * t + 180 * (1.0f - t));
+            const u32 c = argb8888(r, g, b);
+            u32 *row = fb.color + (size_t)yy * fb.pitch_pixels;
+            for (int xx = 0; xx < WIDTH; ++xx) row[xx] = c;
+        }
 
         /* Sort + project (single-threaded). */
-        f32 dist_sq[N_FACES];
-        for (int i = 0; i < N_FACES; ++i) {
+        const int N = g_scene.n_faces;
+        f32 dist_sq[SCENE_MAX_FACES];
+        for (int i = 0; i < N; ++i) {
             order[i] = i;
-            dist_sq[i] = v3_length_sq(v3_sub(face_center(&SCENE_FACES[i]), cam_eye));
+            dist_sq[i] = v3_length_sq(v3_sub(face_center(&g_scene.faces[i]), cam_eye));
         }
-        for (int i = 1; i < N_FACES; ++i) {
+        for (int i = 1; i < N; ++i) {
             const int key = order[i];
             const f32 kd  = dist_sq[key];
             int j = i - 1;
@@ -488,8 +497,8 @@ int main(int argc, char **argv) {
         }
         /* Project a clip space (sin perspective divide — eso lo hacemos POST
          * near-plane clipping, en cada worker). */
-        for (int i = 0; i < N_FACES; ++i) {
-            const bsp_face_t *face = &SCENE_FACES[i];
+        for (int i = 0; i < N; ++i) {
+            const bsp_face_t *face = &g_scene.faces[i];
             for (int v = 0; v < 4; ++v) {
                 const vec4_t v4   = { face->verts[v].x, face->verts[v].y, face->verts[v].z, 1.0f };
                 const vec4_t clip = mat4_mul_vec4(mvp, v4);
@@ -499,6 +508,7 @@ int main(int argc, char **argv) {
                 };
             }
         }
+        pool.n_faces = N;
 
         /* Dispatch a workers + wait. */
         pool_render_frame(&pool);
@@ -520,7 +530,7 @@ int main(int argc, char **argv) {
         /* Selection outline overlay (single-threaded, post workers). Dibuja
          * los 4 edges del quad seleccionado como wireframe naranja. */
         if (selected_face >= 0) {
-            const bsp_face_t *sf = &SCENE_FACES[selected_face];
+            const bsp_face_t *sf = &g_scene.faces[selected_face];
             int sx[4], sy[4];
             bool all_in_front = true;
             for (int i = 0; i < 4; ++i) {
@@ -558,8 +568,16 @@ int main(int argc, char **argv) {
         snprintf(buf, sizeof(buf), "TARGET %.1f %.1f %.1f  R %.1f",
                  (f64)cam_target.x, (f64)cam_target.y, (f64)cam_target.z, (f64)cam_radius);
         draw_text_shadowed(&fb, 14, 42, buf, hud_color);
-        snprintf(buf, sizeof(buf), "L-DRAG ORBIT  R-DRAG PAN  WHEEL ZOOM  F RESET");
+        snprintf(buf, sizeof(buf), "FACES %d / %d", g_scene.n_faces, SCENE_MAX_FACES);
         draw_text_shadowed(&fb, 14, 56, buf, argb8888(180, 180, 180));
+        /* Second line of hints */
+        draw_rect(&fb, 8, HEIGHT - 36, 480, 28, argb8888(0, 0, 0));
+        draw_text_shadowed(&fb, 14, HEIGHT - 30,
+            "LMB ORBIT  RMB PAN  WHEEL ZOOM  CLICK PICK  F FOCUS",
+            argb8888(200, 200, 200));
+        draw_text_shadowed(&fb, 14, HEIGHT - 18,
+            "1 ADD CUBE  2 ADD PILLAR  DEL REMOVE SEL  ESC DESELECT/QUIT",
+            argb8888(200, 200, 200));
 
         SDL_Surface *win_surface = SDL_GetWindowSurface(win);
         if (win_surface) {
