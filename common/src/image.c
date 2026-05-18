@@ -60,27 +60,40 @@ int image_load_ppm(image_t *img, const char *path) {
 }
 
 rgb_t image_sample_bilinear(const image_t *img, f32 u, f32 v) {
-    /* Wrap (u, v) a [0, 1) — texturas tilean en superficies infinitas. */
+    /* WRAP en u (para no tener seam en el meridiano de la esfera);
+     * CLAMP en v (para que el polo no mezcle texels del polo opuesto). */
     u = u - floorf(u);
-    v = v - floorf(v);
     if (u < 0.0f) u += 1.0f;
-    if (v < 0.0f) v += 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
 
-    const f32 fu = u * (f32)(img->w - 1);
-    const f32 fv = v * (f32)(img->h - 1);
-    int iu = (int)fu;
-    int iv = (int)fv;
-    if (iu < 0) iu = 0;
-    if (iv < 0) iv = 0;
-    if (iu > img->w - 2) iu = img->w - 2;
-    if (iv > img->h - 2) iv = img->h - 2;
-    const f32 fx = fu - (f32)iu;
-    const f32 fy = fv - (f32)iv;
+    const int w = img->w, h = img->h;
 
-    const rgb_t c00 = img->pixels[iv * img->w + iu];
-    const rgb_t c10 = img->pixels[iv * img->w + iu + 1];
-    const rgb_t c01 = img->pixels[(iv + 1) * img->w + iu];
-    const rgb_t c11 = img->pixels[(iv + 1) * img->w + iu + 1];
+    /* Centros de los texels están en (i+0.5)/w en u-space. Para muestrear
+     * en (u, v), encontramos los dos texels más cercanos a ambos lados. */
+    const f32 fu = u * (f32)w - 0.5f;
+    const f32 fv = v * (f32)h - 0.5f;
+    int iu0 = (int)floorf(fu);
+    int iv0 = (int)floorf(fv);
+    const f32 fx = fu - (f32)iu0;
+    const f32 fy = fv - (f32)iv0;
+
+    int iu1 = iu0 + 1;
+    int iv1 = iv0 + 1;
+
+    /* u: módulo positivo (handle negative indices). Esto elimina el seam. */
+    iu0 = ((iu0 % w) + w) % w;
+    iu1 = ((iu1 % w) + w) % w;
+    /* v: clamp. */
+    if (iv0 < 0)      iv0 = 0;
+    if (iv0 > h - 1)  iv0 = h - 1;
+    if (iv1 < 0)      iv1 = 0;
+    if (iv1 > h - 1)  iv1 = h - 1;
+
+    const rgb_t c00 = img->pixels[iv0 * w + iu0];
+    const rgb_t c10 = img->pixels[iv0 * w + iu1];
+    const rgb_t c01 = img->pixels[iv1 * w + iu0];
+    const rgb_t c11 = img->pixels[iv1 * w + iu1];
 
     const f32 w00 = (1.0f - fx) * (1.0f - fy);
     const f32 w10 = fx          * (1.0f - fy);

@@ -5,6 +5,7 @@ sw_renderer/sw_renderer
 raytracer/raytracer
 *.ppm
 !raytracer/earth.ppm
+!raytracer/checker.ppm
 core
 core.*
 .vscode/
