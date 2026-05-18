@@ -12,6 +12,9 @@
 #include "rast_scan.h"
 #include "lightmap.h"
 #include "draw_line.h"
+#include "text.h"
+
+#include <stdio.h>   /* snprintf for HUD */
 
 #include <SDL2/SDL.h>
 #include <pthread.h>
@@ -370,13 +373,22 @@ int main(int argc, char **argv) {
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) running = false;
             else if (ev.type == SDL_KEYDOWN) {
-                if (ev.key.keysym.sym == SDLK_ESCAPE) running = false;
+                if (ev.key.keysym.sym == SDLK_ESCAPE && selected_face < 0) running = false;
                 else if (ev.key.keysym.sym == SDLK_f) {
-                    /* Reset cámara a default. */
-                    cam_target = (vec3_t){ 0.0f, 2.0f, -2.5f };
-                    cam_yaw    = 0.0f;
-                    cam_pitch  = 0.2f;
-                    cam_radius = 6.5f;
+                    /* F: focus selected (frame view on selection), o reset si nada. */
+                    if (selected_face >= 0) {
+                        cam_target = face_center(&SCENE_FACES[selected_face]);
+                        cam_radius = 4.5f;
+                    } else {
+                        cam_target = (vec3_t){ 0.0f, 2.0f, -2.5f };
+                        cam_yaw    = 0.0f;
+                        cam_pitch  = 0.2f;
+                        cam_radius = 6.5f;
+                    }
+                }
+                else if (ev.key.keysym.sym == SDLK_ESCAPE && selected_face >= 0) {
+                    /* ESC también deselecciona. Se sigue saliendo si no hay selección. */
+                    selected_face = -1;
                 }
             }
             else if (ev.type == SDL_MOUSEBUTTONDOWN) {
@@ -491,6 +503,20 @@ int main(int argc, char **argv) {
         /* Dispatch a workers + wait. */
         pool_render_frame(&pool);
 
+        /* ─── HUD overlay (single-threaded, post workers) ─── */
+        const u64 hud_now = SDL_GetPerformanceCounter();
+        static u64 last_hud_ts = 0;
+        static u32 cached_fps = 0;
+        static u32 hud_frame_count = 0;
+        hud_frame_count++;
+        if (last_hud_ts == 0) last_hud_ts = hud_now;
+        const f64 elapsed_s = (f64)(hud_now - last_hud_ts) / (f64)SDL_GetPerformanceFrequency();
+        if (elapsed_s >= 0.25) {
+            cached_fps = (u32)((f64)hud_frame_count / elapsed_s);
+            hud_frame_count = 0;
+            last_hud_ts = hud_now;
+        }
+
         /* Selection outline overlay (single-threaded, post workers). Dibuja
          * los 4 edges del quad seleccionado como wireframe naranja. */
         if (selected_face >= 0) {
@@ -515,6 +541,25 @@ int main(int argc, char **argv) {
                 }
             }
         }
+
+        /* ─── HUD text overlay ─── */
+        char buf[96];
+        const u32 hud_color = argb8888(255, 255, 255);
+        /* Semi-transparent black backdrop (drawn solid for now; alpha later). */
+        draw_rect(&fb, 8, 8, 360, 64, argb8888(0, 0, 0));
+        snprintf(buf, sizeof(buf), "FPS %u  THREADS %d", cached_fps, pool.n);
+        draw_text_shadowed(&fb, 14, 14, buf, hud_color);
+        if (selected_face >= 0) {
+            snprintf(buf, sizeof(buf), "SELECTED FACE %d", selected_face);
+        } else {
+            snprintf(buf, sizeof(buf), "SELECTED NONE  CLICK TO PICK");
+        }
+        draw_text_shadowed(&fb, 14, 28, buf, hud_color);
+        snprintf(buf, sizeof(buf), "TARGET %.1f %.1f %.1f  R %.1f",
+                 (f64)cam_target.x, (f64)cam_target.y, (f64)cam_target.z, (f64)cam_radius);
+        draw_text_shadowed(&fb, 14, 42, buf, hud_color);
+        snprintf(buf, sizeof(buf), "L-DRAG ORBIT  R-DRAG PAN  WHEEL ZOOM  F RESET");
+        draw_text_shadowed(&fb, 14, 56, buf, argb8888(180, 180, 180));
 
         SDL_Surface *win_surface = SDL_GetWindowSurface(win);
         if (win_surface) {
