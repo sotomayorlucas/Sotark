@@ -10,3 +10,9 @@ core
 core.*
 .vscode/
 .claude/
+
+# C++26 port (cxx26 branch)
+build/
+compile_commands.json
+*.gcm
+*.cppm.o.modmap
